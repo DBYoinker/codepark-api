@@ -117,10 +117,12 @@ function toDevShape(row, index) {
     bio:               row.bio || "",
 
     footprint: {
-      totalStars:    row.star_count            || 0,
-      followers:     row.follower_count        || 0,
-      originalRepos: row.original_repo_count   || 0,
-      forksReceived: row.forks_received        || 0,
+      totalStars:    row.star_count             || 0,
+      followers:     row.follower_count         || 0,
+      originalRepos: row.original_repo_count    || 0,
+      repoCount:     row.repo_count             || 0,
+      forkedRepos:   row.forked_repo_count      || 0,
+      forksReceived: row.forks_received         || 0,
     },
 
     languages: {
