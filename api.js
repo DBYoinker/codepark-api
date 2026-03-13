@@ -22,26 +22,75 @@ function query(sql, params = []) {
   );
 }
 
-// ── TRANSFORM: raw DB row → Developer shape Loveable expects ──────────────────
-function toDevShape(row, index) {
-  // Parse JSON blobs safely
-  const spotlight  = safeJSON(row.spotlight_repo_json);
-  const top10      = safeJSON(row.top10_repos_json, []);
+// ── HELPERS ───────────────────────────────────────────────────────────────────
+function safeJSON(str, fallback = null) {
+  if (!str) return fallback;
+  try { return JSON.parse(str); } catch { return fallback; }
+}
+
+function deriveActivityScore(r) {
+  const days     = Math.min((r.active_days_365 || 0) / 365 * 50, 50);
+  const contribs = Math.min((r.contrib_365d    || 0) / 1000 * 50, 50);
+  return Math.round(days + contribs);
+}
+
+function deriveImpactScore(r) {
+  const stars  = Math.min(Math.log10((r.star_count     || 0) + 1) / 5 * 50, 50);
+  const forks  = Math.min(Math.log10((r.forks_received || 0) + 1) / 4 * 30, 30);
+  const follow = Math.min(Math.log10((r.follower_count || 0) + 1) / 4 * 20, 20);
+  return Math.round(stars + forks + follow);
+}
+
+function deriveSeniorityScore(r) {
+  const merge  = Math.min((r.pr_merge_rate   || 0) * 0.4, 40);
+  const review = Math.min((r.code_review_pct || 0) * 0.5, 20);
+  const ext    = Math.min(Math.log10((r.external_prs || 0) + 1) / 3 * 20, 20);
+  const orgs   = Math.min((r.org_count        || 0) * 2, 10);
+  const tenure = Math.min(
+    Math.floor((Date.now() - new Date(r.github_created_at || Date.now()).getTime()) / (1000*60*60*24*365)) * 1.5,
+    10
+  );
+  return Math.round(merge + review + ext + orgs + tenure);
+}
+
+function deriveBadges(r) {
+  const badges = [];
+  if ((r.commit_pct      || 0) > 60) badges.push("Builder");
+  if ((r.code_review_pct || 0) > 15) badges.push("Reviewer");
+  if ((r.external_prs    || 0) > 20) badges.push("Collaborator");
+  return badges;
+}
+
+function deriveImpactBadges(r) {
+  const badges = [];
+  if ((r.follower_count || 0) > 1000) badges.push("OSS Influencer");
+  if ((r.star_count || 0) / Math.max(r.original_repo_count || 1, 1) > 100) badges.push("High Signal Per Project");
+  return badges;
+}
+
+function deriveSeniorityBadges(r, tenureYears) {
+  const badges = [];
+  if (tenureYears >= 6 && (r.pr_merge_rate || 0) > 85) badges.push("Senior Signal");
+  if ((r.org_count || 0) >= 3) badges.push("Enterprise Engineer");
+  if (tenureYears < 3) badges.push("Emerging Talent");
+  return badges;
+}
+
+// ── TRANSFORM: raw DB row → Developer shape ───────────────────────────────────
+function toDevShape(row) {
+  const spotlight   = safeJSON(row.spotlight_repo_json);
+  const top10       = safeJSON(row.top10_repos_json, []);
   const alltimeLang = safeJSON(row.alltime_languages_json, {});
   const recentLang  = safeJSON(row.recent_languages_json, {});
 
-  // Languages → [{name, pct, starred}]
   const alltimeLangs = Object.entries(alltimeLang)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 6)
+    .sort((a, b) => b[1] - a[1]).slice(0, 6)
     .map(([name, pct], i) => ({ name, pct: Math.round(pct), starred: i < 2 }));
 
   const recentLangs = Object.entries(recentLang)
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 6)
+    .sort((a, b) => b[1] - a[1]).slice(0, 6)
     .map(([name, pct], i) => ({ name, pct: Math.round(pct), starred: i < 2 }));
 
-  // Skill tags — use alltime/recent primary+secondary+third
   const alltimeTags = [
     row.alltime_primary_tag,
     row.alltime_secondary_tag,
@@ -54,7 +103,6 @@ function toDevShape(row, index) {
     row.recent_third_tag,
   ].filter(Boolean);
 
-  // Contribution trend — from raw window counts
   const trend = [
     { period: "30d",  value: row.contrib_30d  || 0 },
     { period: "90d",  value: row.contrib_90d  || 0 },
@@ -62,32 +110,19 @@ function toDevShape(row, index) {
     { period: "365d", value: row.contrib_365d || 0 },
   ];
 
-  // Momentum: compare 30d vs 90d average
-  const avg90 = (row.contrib_90d || 0) / 3;
-  const daily30 = row.contrib_30d || 0;
-  const momentum = daily30 > avg90 * 1.15 ? "High"
-                 : daily30 < avg90 * 0.85 ? "Low"
-                 : "Medium";
-
-  // Production readiness — from depth data
-  const hasCI      = (row.repos_with_ci      || 0) > 0;
-  const hasTests   = (row.repos_with_tests   || 0) > 0;
-  const hasDocker  = top10.some(r => r.has_ci); // docker counted in CI check
-  const hasLicense = (row.repos_with_license || 0) > 0;
-
-  // Scores — use computed columns if present, otherwise derive simple proxies
-  // These will be replaced by calculate_scores.js later
-  const activityScore  = row.activity_score   ?? deriveActivityScore(row);
-  const impactScore    = row.impact_score      ?? deriveImpactScore(row);
-  const seniorityScore = row.seniority_score   ?? deriveSeniorityScore(row);
-  const surfaceScore   = row.surface_score     ?? deriveImpactScore(row); // same as impact for now
-
-  // GitHub tenure in years
   const tenureYears = row.github_created_at
-    ? Math.floor((Date.now() - new Date(row.github_created_at).getTime()) / (1000 * 60 * 60 * 24 * 365))
+    ? Math.floor((Date.now() - new Date(row.github_created_at).getTime()) / (1000*60*60*24*365))
     : 0;
 
-  // Project spotlight
+  const activityScore  = row.activity_score  ?? deriveActivityScore(row);
+  const impactScore    = row.impact_score     ?? deriveImpactScore(row);
+  const seniorityScore = row.seniority_score  ?? deriveSeniorityScore(row);
+
+  const hasCI      = (row.repos_with_ci      || 0) > 0;
+  const hasTests   = (row.repos_with_tests   || 0) > 0;
+  const hasDocker  = top10.some(r => r.has_ci);
+  const hasLicense = (row.repos_with_license || 0) > 0;
+
   const ps = spotlight || {};
   const projectSpotlight = {
     repoName:    ps.name        || "",
@@ -101,14 +136,13 @@ function toDevShape(row, index) {
 
   return {
     id:                `CP-${String(row.id).padStart(6, "0")}`,
-    name:              row.full_name  || row.username,
+    name:              row.full_name || row.username,
     company:           row.company   || "",
     role:              row.alltime_primary_tag || "",
     location:          row.city      || "",
     blog:              row.blog_url  || "",
     linkedin:          row.linkedin_url || "",
-    linkedinConfidence: (row.linkedin_confidence || 0) > 0.7,
-    twitter:           row.twitter_url || "",
+    twitter:           row.twitter_url  || "",
     twitterFollowers:  row.twitter_follower_count || 0,
     githubUsername:    row.username,
     githubTenureYears: tenureYears,
@@ -116,13 +150,38 @@ function toDevShape(row, index) {
     email:             row.public_email || "",
     bio:               row.bio || "",
 
+    // ── AI Fields ────────────────────────────────────────────────────────────
+    ai: {
+      overview:            row.ai_overview           || null,
+      standoutSignals:     [
+        row.standout_1,
+        row.standout_2,
+        row.standout_3,
+        row.standout_4,
+      ].filter(Boolean),
+      risks:               [
+        row.risk_1,
+        row.risk_2,
+        row.risk_3,
+      ].filter(Boolean),
+      collaborationScore:  row.collaboration_score   ?? null,
+      collaborationSummary:row.collaboration_summary || null,
+      seniority:           row.ai_seniority          || null,
+      shortlistScore:      row.ai_shortlist_score     ?? null,
+      processedAt:         row.ai_processed_at        || null,
+    },
+
+    // ── Status ───────────────────────────────────────────────────────────────
+    activityStatus:    row.activity_status || null,   // Actively Coding / Recently Coding / Inactive
+    momentum:          row.momentum        || null,   // Accelerating / Stable / Declining
+
     footprint: {
-      totalStars:    row.star_count             || 0,
-      followers:     row.follower_count         || 0,
-      originalRepos: row.original_repo_count    || 0,
-      repoCount:     row.repo_count             || 0,
-      forkedRepos:   row.forked_repo_count      || 0,
-      forksReceived: row.forks_received         || 0,
+      totalStars:    row.star_count          || 0,
+      followers:     row.follower_count      || 0,
+      originalRepos: row.original_repo_count || 0,
+      repoCount:     row.repo_count          || 0,
+      forkedRepos:   row.forked_repo_count   || 0,
+      forksReceived: row.forks_received      || 0,
     },
 
     languages: {
@@ -136,10 +195,10 @@ function toDevShape(row, index) {
     },
 
     activity: {
-      score:          activityScore,
-      activeDays365:  row.active_days_365  || 0,
-      contributions90d: row.contrib_90d   || 0,
-      momentum,
+      score:            activityScore,
+      activeDays365:    row.active_days_365 || 0,
+      contributions90d: row.contrib_90d     || 0,
+      momentum:         row.momentum        || "Stable",
       trend,
     },
 
@@ -162,12 +221,20 @@ function toDevShape(row, index) {
 
     seniority: {
       score:        seniorityScore,
+      label:        row.ai_seniority    || null,
       reviewPct:    Math.round(row.code_review_pct || 0),
       prMergeRate:  Math.round(row.pr_merge_rate   || 0),
       externalPRs:  row.external_prs               || 0,
       tenureYears,
       organizations: row.org_count                 || 0,
       badges:        deriveSeniorityBadges(row, tenureYears),
+    },
+
+    scores: {
+      activity:      row.activity_score    ?? deriveActivityScore(row),
+      credibility:   row.credibility_score ?? 0,
+      collaboration: row.collab_score      ?? 0,
+      shortlist:     row.ai_shortlist_score ?? 0,
     },
 
     productionReadiness: {
@@ -179,7 +246,6 @@ function toDevShape(row, index) {
 
     projectSpotlight,
 
-    // Extra fields available for detail page / future use
     _raw: {
       activity_graph_json:    row.activity_graph_json,
       weekly_activity_json:   row.weekly_activity_json,
@@ -192,64 +258,9 @@ function toDevShape(row, index) {
   };
 }
 
-// ── SIMPLE SCORE DERIVATIONS (until calculate_scores.js runs) ─────────────────
-function deriveActivityScore(r) {
-  const days    = Math.min((r.active_days_365 || 0) / 365 * 50, 50);
-  const contribs = Math.min((r.contrib_365d  || 0) / 1000 * 50, 50);
-  return Math.round(days + contribs);
-}
-
-function deriveImpactScore(r) {
-  const stars   = Math.min(Math.log10((r.star_count       || 0) + 1) / 5 * 50, 50);
-  const forks   = Math.min(Math.log10((r.forks_received   || 0) + 1) / 4 * 30, 30);
-  const follow  = Math.min(Math.log10((r.follower_count   || 0) + 1) / 4 * 20, 20);
-  return Math.round(stars + forks + follow);
-}
-
-function deriveSeniorityScore(r) {
-  const merge   = Math.min((r.pr_merge_rate    || 0) * 0.4, 40);
-  const review  = Math.min((r.code_review_pct  || 0) * 0.5, 20);
-  const ext     = Math.min(Math.log10((r.external_prs || 0) + 1) / 3 * 20, 20);
-  const orgs    = Math.min((r.org_count         || 0) * 2, 10);
-  const tenure  = Math.min(
-    Math.floor((Date.now() - new Date(r.github_created_at || Date.now()).getTime()) / (1000*60*60*24*365)) * 1.5,
-    10
-  );
-  return Math.round(merge + review + ext + orgs + tenure);
-}
-
-function deriveBadges(r) {
-  const badges = [];
-  if ((r.commit_pct || 0) > 60) badges.push("Builder");
-  if ((r.code_review_pct || 0) > 15) badges.push("Reviewer");
-  if ((r.external_prs || 0) > 20) badges.push("Collaborator");
-  return badges;
-}
-
-function deriveImpactBadges(r) {
-  const badges = [];
-  if ((r.follower_count || 0) > 1000) badges.push("OSS Influencer");
-  const perRepo = (r.original_repo_count || 1);
-  if ((r.star_count || 0) / perRepo > 100) badges.push("High Signal Per Project");
-  return badges;
-}
-
-function deriveSeniorityBadges(r, tenureYears) {
-  const badges = [];
-  if (tenureYears >= 6 && (r.pr_merge_rate || 0) > 85) badges.push("Senior Signal");
-  if ((r.org_count || 0) >= 3) badges.push("Enterprise Engineer");
-  if (tenureYears < 3) badges.push("Emerging Talent");
-  return badges;
-}
-
-function safeJSON(str, fallback = null) {
-  if (!str) return fallback;
-  try { return JSON.parse(str); } catch { return fallback; }
-}
-
 // ── ROUTES ────────────────────────────────────────────────────────────────────
 
-// GET /api/users — main list with search, sort, filter, pagination
+// GET /api/users — paginated list with search, sort, filter
 app.get("/api/users", async (req, res) => {
   try {
     const {
@@ -258,6 +269,8 @@ app.get("/api/users", async (req, res) => {
       tag      = "",
       city     = "",
       language = "",
+      status   = "",   // Actively Coding / Recently Coding / Inactive
+      seniority = "",  // Senior / Mid-Level / Junior etc
       limit    = 50,
       offset   = 0,
     } = req.query;
@@ -269,7 +282,7 @@ app.get("/api/users", async (req, res) => {
       conditions.push(`(
         username LIKE ? OR full_name LIKE ? OR company LIKE ? OR
         city LIKE ? OR bio LIKE ? OR
-        alltime_languages LIKE ? OR alltime_primary_tag LIKE ?
+        alltime_languages_json LIKE ? OR alltime_primary_tag LIKE ?
       )`);
       const like = `%${q}%`;
       params.push(like, like, like, like, like, like, like);
@@ -286,29 +299,41 @@ app.get("/api/users", async (req, res) => {
     }
 
     if (language) {
-      conditions.push(`alltime_languages LIKE ?`);
+      conditions.push(`alltime_languages_json LIKE ?`);
       params.push(`%${language}%`);
     }
 
-    const orderMap = {
-      activity: "contrib_365d DESC",
-      impact:   "star_count DESC",
-      seniority:"pr_merge_rate DESC",
-      name:     "full_name ASC",
-      stars:    "star_count DESC",
-      followers:"follower_count DESC",
-    };
-    const orderBy = orderMap[sort] || "contrib_365d DESC";
+    if (status) {
+      conditions.push(`activity_status = ?`);
+      params.push(status);
+    }
 
-    const where = conditions.join(" AND ");
+    if (seniority) {
+      conditions.push(`ai_seniority = ?`);
+      params.push(seniority);
+    }
+
+    const orderMap = {
+      activity:    "contrib_365d DESC",
+      impact:      "star_count DESC",
+      seniority:   "pr_merge_rate DESC",
+      shortlist:   "ai_shortlist_score DESC",
+      credibility: "credibility_score DESC",
+      collab:      "collab_score DESC",
+      name:        "full_name ASC",
+      stars:       "star_count DESC",
+      followers:   "follower_count DESC",
+    };
+    const orderBy = orderMap[sort] || "ai_shortlist_score DESC";
+    const where   = conditions.join(" AND ");
 
     const [countRow] = await query(
-      `SELECT COUNT(*) as total FROM users WHERE ${where}`,
+      `SELECT COUNT(*) as total FROM analyzed_users WHERE ${where}`,
       params
     );
 
     const rows = await query(
-      `SELECT * FROM users WHERE ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
+      `SELECT * FROM analyzed_users WHERE ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
       [...params, parseInt(limit), parseInt(offset)]
     );
 
@@ -332,9 +357,9 @@ app.get("/api/users/:id", async (req, res) => {
 
     if (id.startsWith("CP-")) {
       const numericId = parseInt(id.replace("CP-", ""));
-      [row] = await query(`SELECT * FROM users WHERE id = ?`, [numericId]);
+      [row] = await query(`SELECT * FROM analyzed_users WHERE id = ?`, [numericId]);
     } else {
-      [row] = await query(`SELECT * FROM users WHERE username = ?`, [id]);
+      [row] = await query(`SELECT * FROM analyzed_users WHERE username = ?`, [id]);
     }
 
     if (!row) return res.status(404).json({ error: "Developer not found" });
@@ -344,7 +369,7 @@ app.get("/api/users/:id", async (req, res) => {
   }
 });
 
-// GET /api/stats — database summary stats for the header
+// GET /api/stats — summary stats for the header
 app.get("/api/stats", async (req, res) => {
   try {
     const [counts] = await query(`
@@ -353,8 +378,10 @@ app.get("/api/stats", async (req, res) => {
         COUNT(DISTINCT city) as cities,
         COUNT(DISTINCT alltime_primary_tag) as tags,
         AVG(star_count) as avg_stars,
-        SUM(star_count) as total_stars
-      FROM users
+        SUM(star_count) as total_stars,
+        COUNT(CASE WHEN activity_status = 'Actively Coding' THEN 1 END) as active_count,
+        COUNT(CASE WHEN ai_shortlist_score >= 65 THEN 1 END) as shortlist_count
+      FROM analyzed_users
     `);
     res.json(counts);
   } catch (err) {
@@ -366,12 +393,18 @@ app.get("/api/stats", async (req, res) => {
 app.get("/api/filters", async (req, res) => {
   try {
     const cities = await query(
-      `SELECT city, COUNT(*) as count FROM users WHERE city != '' GROUP BY city ORDER BY count DESC LIMIT 50`
+      `SELECT city, COUNT(*) as count FROM analyzed_users WHERE city != '' GROUP BY city ORDER BY count DESC LIMIT 50`
     );
     const tags = await query(
-      `SELECT alltime_primary_tag as tag, COUNT(*) as count FROM users WHERE alltime_primary_tag IS NOT NULL GROUP BY alltime_primary_tag ORDER BY count DESC`
+      `SELECT alltime_primary_tag as tag, COUNT(*) as count FROM analyzed_users WHERE alltime_primary_tag IS NOT NULL GROUP BY alltime_primary_tag ORDER BY count DESC`
     );
-    res.json({ cities, tags });
+    const seniorities = await query(
+      `SELECT ai_seniority as seniority, COUNT(*) as count FROM analyzed_users WHERE ai_seniority IS NOT NULL GROUP BY ai_seniority ORDER BY count DESC`
+    );
+    const statuses = await query(
+      `SELECT activity_status as status, COUNT(*) as count FROM analyzed_users WHERE activity_status IS NOT NULL GROUP BY activity_status ORDER BY count DESC`
+    );
+    res.json({ cities, tags, seniorities, statuses });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
