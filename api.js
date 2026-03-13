@@ -152,23 +152,26 @@ function toDevShape(row) {
 
     // ── AI Fields ────────────────────────────────────────────────────────────
     ai: {
-      overview:            row.ai_overview           || null,
-      standoutSignals:     [
+      overview:             row.ai_overview           || null,
+      overviewCollab:       row.ai_overview_collab    || null,
+      standoutSignals:      [
         row.standout_1,
         row.standout_2,
         row.standout_3,
         row.standout_4,
       ].filter(Boolean),
-      risks:               [
+      risks:                [
         row.risk_1,
         row.risk_2,
         row.risk_3,
       ].filter(Boolean),
-      collaborationScore:  row.collaboration_score   ?? null,
-      collaborationSummary:row.collaboration_summary || null,
-      seniority:           row.ai_seniority          || null,
-      shortlistScore:      row.ai_shortlist_score     ?? null,
-      processedAt:         row.ai_processed_at        || null,
+      collaborationScore:   row.collaboration_score   ?? null,
+      collaborationSummary: row.collaboration_summary || null,
+      collaborationTags:    row.collaboration_tags ? row.collaboration_tags.split(", ").filter(Boolean) : [],
+      shortlistTags:        row.shortlist_tags     ? row.shortlist_tags.split(", ").filter(Boolean)     : [],
+      seniority:            row.ai_seniority          || null,
+      shortlistScore:       row.ai_shortlist_score     ?? null,
+      processedAt:          row.ai_processed_at        || null,
     },
 
     // ── Status ───────────────────────────────────────────────────────────────
